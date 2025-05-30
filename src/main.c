@@ -24,10 +24,13 @@ static char hex_string[HEX_STRING_LENGTH];
 static bool heartbeat_led_state;
 static bool packet_led_state;
 static k_timeout_t heartbeat_interval;
-
+static k_timeout_t sweep_interval;
+static uint32_t sweep_channel_end;
 static void heartbeat(struct k_work *work);
+static void sweep(struct k_work *work);
 
 static K_WORK_DELAYABLE_DEFINE(heartbeat_work, heartbeat);
+static K_WORK_DELAYABLE_DEFINE(sweep_work, sweep);
 
 static void heartbeat(struct k_work *work)
 {
@@ -36,6 +39,30 @@ static void heartbeat(struct k_work *work)
 	heartbeat_led_state = !heartbeat_led_state;
 	dk_set_led(DK_LED1, heartbeat_led_state);
 	k_work_reschedule(&heartbeat_work, heartbeat_interval);
+}
+
+static void sweep(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	
+	radio_api->stop(radio_dev);
+	uint32_t channel = nrf_802154_channel_get();
+	if (channel == sweep_channel_end) {
+		shell_print(uart_shell, "done sweeping");
+		
+		heartbeat_interval = K_SECONDS(1);
+
+		packet_led_state = false;
+		dk_set_led(DK_LED4, packet_led_state);
+		
+		return;
+	}
+	shell_print(uart_shell, "now listening on channel: %d", channel+1);
+
+        radio_api->set_channel(radio_dev, channel+1);
+	radio_api->start(radio_dev);
+
+	k_work_reschedule(&sweep_work, sweep_interval);
 }
 
 enum net_verdict ieee802154_handle_ack(struct net_if *iface,
@@ -102,6 +129,55 @@ static int cmd_channel(const struct shell *shell, size_t argc, char **argv)
 }
 SHELL_CMD_ARG_REGISTER(channel, NULL, "Set radio channel", cmd_channel, 1, 1);
 
+static int cmd_toggle(const struct shell *shell, size_t argc, char **argv)
+{
+	ARG_UNUSED(shell);
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	packet_led_state = !packet_led_state;
+	dk_set_led(DK_LED4, packet_led_state);
+
+	return 0;
+}
+SHELL_CMD_ARG_REGISTER(toggle, NULL, "Toggle led", cmd_toggle, 1, 0);
+
+
+static int cmd_sweep(const struct shell *shell, size_t argc, char **argv)
+{
+	uint32_t channel_start = 0;
+	uint32_t channel_end = 0;
+
+	switch (argc) {
+	case 4:
+		sweep_interval = K_SECONDS(atoi(argv[3]));
+	case 3:
+		channel_start = atoi(argv[1]);
+		channel_end = atoi(argv[2]);
+		if (channel_end < channel_start) {
+			shell_print(shell, "end channel should be > start channnel");
+			return 0;
+		}
+		break;
+	default:
+		shell_print(shell, "invalid number of parameters: %d", argc);
+		return 0;
+	}
+
+        shell_print(uart_shell, "starting sweep from channel %d-%d", channel_start, channel_end);
+        shell_print(uart_shell, "now listening on channel: %d", channel_start);
+
+	heartbeat_interval = K_MSEC(100);
+	sweep_channel_end = channel_end;
+	radio_api->set_channel(radio_dev, channel_start);
+	radio_api->start(radio_dev);
+
+	k_work_reschedule(&sweep_work, sweep_interval);
+
+	return 0;
+}
+SHELL_CMD_ARG_REGISTER(sweep, NULL, "Sweep trough specified channels <start> <end> (<secs>)", cmd_sweep, 3, 1);
+
 static int cmd_receive(const struct shell *shell, size_t argc, char **argv)
 {
 	ARG_UNUSED(shell);
@@ -124,6 +200,11 @@ static int cmd_sleep(const struct shell *shell, size_t argc, char **argv)
 	heartbeat_interval = K_SECONDS(1);
 	radio_api->stop(radio_dev);
 
+	packet_led_state = false;
+	dk_set_led(DK_LED4, packet_led_state);
+	
+	k_work_cancel_delayable(&sweep_work);
+
 	return 0;
 }
 SHELL_CMD_ARG_REGISTER(sleep, NULL, "Disable the radio", cmd_sleep, 1, 0);
@@ -134,6 +215,7 @@ int main(void)
 
 	uart_shell = shell_backend_uart_get_ptr();
 	heartbeat_interval = K_SECONDS(1);
+	sweep_interval = K_SECONDS(30);
 	k_work_reschedule(&heartbeat_work, heartbeat_interval);
 
 	struct ieee802154_config config = {
