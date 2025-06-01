@@ -4,21 +4,15 @@
  * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
  */
 
-#include <zephyr/kernel.h>
-#include <zephyr/net/ieee802154_radio.h>
+#include <stdlib.h>
+#include <nrf_802154_const.h>
 #include <zephyr/shell/shell.h>
 #include <zephyr/shell/shell_uart.h>
-#include <zephyr/sys/util.h>
-#include <nrf_802154.h>
-#include <nrf_802154_const.h>
-#include <stdlib.h>
 #include <dk_buttons_and_leds.h>
+#include "./sniffer.h"
 
 #define HEX_STRING_LENGTH (2 * MAX_PACKET_SIZE + 1)
 
-static const struct device *radio_dev =
-	DEVICE_DT_GET(DT_CHOSEN(zephyr_ieee802154));
-static struct ieee802154_radio_api *radio_api;
 static const struct shell *uart_shell;
 static char hex_string[HEX_STRING_LENGTH];
 static bool heartbeat_led_state;
@@ -28,9 +22,29 @@ static k_timeout_t sweep_interval;
 static uint32_t sweep_channel_end;
 static void heartbeat(struct k_work *work);
 static void sweep(struct k_work *work);
+static sniffer_t *sniffer;
 
 static K_WORK_DELAYABLE_DEFINE(heartbeat_work, heartbeat);
 static K_WORK_DELAYABLE_DEFINE(sweep_work, sweep);
+
+void log_packet(
+	uint8_t *psdu,
+    size_t length,
+	uint8_t lqi,
+	int8_t rssi,
+	uint64_t timestamp
+) {
+	packet_led_state = !packet_led_state;
+	dk_set_led(DK_LED4, packet_led_state);
+	bin2hex(psdu, length, hex_string, HEX_STRING_LENGTH);
+
+	shell_print(uart_shell,
+			"received: %s power: %d lqi: %u time: %llu",
+			hex_string,
+			rssi,
+			lqi,
+			timestamp);
+}
 
 static void heartbeat(struct k_work *work)
 {
@@ -45,8 +59,8 @@ static void sweep(struct k_work *work)
 {
 	ARG_UNUSED(work);
 	
-	radio_api->stop(radio_dev);
-	uint32_t channel = nrf_802154_channel_get();
+	sniffer->stop();
+	uint32_t channel = sniffer->get_channel();
 	if (channel == sweep_channel_end) {
 		shell_print(uart_shell, "done sweeping");
 		
@@ -59,53 +73,10 @@ static void sweep(struct k_work *work)
 	}
 	shell_print(uart_shell, "now listening on channel: %d", channel+1);
 
-        radio_api->set_channel(radio_dev, channel+1);
-	radio_api->start(radio_dev);
+	sniffer->set_channel(channel+1);
+	sniffer->start();
 
 	k_work_reschedule(&sweep_work, sweep_interval);
-}
-
-enum net_verdict ieee802154_handle_ack(struct net_if *iface,
-				       struct net_pkt *pkt)
-{
-	ARG_UNUSED(iface);
-	ARG_UNUSED(pkt);
-
-	return NET_DROP;
-}
-
-int net_recv_data(struct net_if *iface, struct net_pkt *pkt)
-{
-	if (!pkt) {
-		return -EINVAL;
-	}
-
-	if (net_pkt_is_empty(pkt)) {
-		return -ENODATA;
-	}
-
-	uint8_t *psdu = net_buf_frag_last(pkt->buffer)->data;
-	size_t length = net_buf_frags_len(pkt->buffer);
-	uint8_t lqi = net_pkt_ieee802154_lqi(pkt);
-	int8_t rssi = net_pkt_ieee802154_rssi_dbm(pkt);
-	struct net_ptp_time *pkt_time = net_pkt_timestamp(pkt);
-	uint64_t timestamp =
-		pkt_time->second * USEC_PER_SEC + pkt_time->nanosecond / NSEC_PER_USEC;
-
-	packet_led_state = !packet_led_state;
-	dk_set_led(DK_LED4, packet_led_state);
-	bin2hex(psdu, length, hex_string, HEX_STRING_LENGTH);
-
-	shell_print(uart_shell,
-		    "received: %s power: %d lqi: %u time: %llu",
-		    hex_string,
-		    rssi,
-		    lqi,
-		    timestamp);
-
-	net_pkt_unref(pkt);
-
-	return 0;
 }
 
 static int cmd_channel(const struct shell *shell, size_t argc, char **argv)
@@ -114,11 +85,11 @@ static int cmd_channel(const struct shell *shell, size_t argc, char **argv)
 
 	switch (argc) {
 	case 1:
-		shell_print(shell, "%d", nrf_802154_channel_get());
+		shell_print(shell, "%d", sniffer->get_channel());
 		break;
 	case 2:
 		channel = atoi(argv[1]);
-		radio_api->set_channel(radio_dev, channel);
+		sniffer->set_channel(channel);
 		break;
 	default:
 		shell_print(shell, "invalid number of parameters: %d", argc);
@@ -142,41 +113,51 @@ static int cmd_toggle(const struct shell *shell, size_t argc, char **argv)
 }
 SHELL_CMD_ARG_REGISTER(toggle, NULL, "Toggle led", cmd_toggle, 1, 0);
 
-
 static int cmd_sweep(const struct shell *shell, size_t argc, char **argv)
 {
-	uint32_t channel_start = 0;
-	uint32_t channel_end = 0;
+    uint32_t channel_min = sniffer->get_channel_min();
+	uint32_t channel_max = sniffer->get_channel_max();
+	uint32_t channel_start = channel_min;
+	uint32_t channel_end = channel_max;
+    uint32_t interval = 30;
 
 	switch (argc) {
 	case 4:
-		sweep_interval = K_SECONDS(atoi(argv[3]));
+		channel_end = atoi(argv[3]);
 	case 3:
-		channel_start = atoi(argv[1]);
-		channel_end = atoi(argv[2]);
-		if (channel_end < channel_start) {
-			shell_print(shell, "end channel should be > start channnel");
-			return 0;
-		}
+		channel_start = atoi(argv[2]);
+	case 2:
+		interval = atoi(argv[1]);
 		break;
 	default:
 		shell_print(shell, "invalid number of parameters: %d", argc);
 		return 0;
 	}
 
-        shell_print(uart_shell, "starting sweep from channel %d-%d", channel_start, channel_end);
-        shell_print(uart_shell, "now listening on channel: %d", channel_start);
+	if (channel_end < channel_start) {
+		shell_print(shell, "end channel should be > start channnel");
+		return 0;
+	}
 
+	if (channel_end > channel_max || channel_start < channel_min) {
+		shell_print(shell, "channels should be between %d and %d", channel_min, channel_max);
+		return 0;
+	}
+
+	shell_print(uart_shell, "starting sweep from channel %d-%d (%d second interval)", channel_start, channel_end, interval);
+	shell_print(uart_shell, "now listening on channel: %d", channel_start);
+
+    sweep_interval = K_SECONDS(interval);
 	heartbeat_interval = K_MSEC(100);
 	sweep_channel_end = channel_end;
-	radio_api->set_channel(radio_dev, channel_start);
-	radio_api->start(radio_dev);
+	sniffer->set_channel(channel_start);
+	sniffer->start();
 
 	k_work_reschedule(&sweep_work, sweep_interval);
 
 	return 0;
 }
-SHELL_CMD_ARG_REGISTER(sweep, NULL, "Sweep trough specified channels <start> <end> (<secs>)", cmd_sweep, 3, 1);
+SHELL_CMD_ARG_REGISTER(sweep, NULL, "Sweep trough channels [secs] [start] [end]", cmd_sweep, 1, 3);
 
 static int cmd_receive(const struct shell *shell, size_t argc, char **argv)
 {
@@ -185,7 +166,7 @@ static int cmd_receive(const struct shell *shell, size_t argc, char **argv)
 	ARG_UNUSED(argv);
 
 	heartbeat_interval = K_MSEC(250);
-	radio_api->start(radio_dev);
+	sniffer->start();
 
 	return 0;
 }
@@ -198,7 +179,7 @@ static int cmd_sleep(const struct shell *shell, size_t argc, char **argv)
 	ARG_UNUSED(argv);
 
 	heartbeat_interval = K_SECONDS(1);
-	radio_api->stop(radio_dev);
+	sniffer->stop();
 
 	packet_led_state = false;
 	dk_set_led(DK_LED4, packet_led_state);
@@ -218,19 +199,8 @@ int main(void)
 	sweep_interval = K_SECONDS(30);
 	k_work_reschedule(&heartbeat_work, heartbeat_interval);
 
-	struct ieee802154_config config = {
-		.promiscuous = true
-	};
-
-	radio_api = (struct ieee802154_radio_api *)radio_dev->api;
-	__ASSERT_NO_MSG(radio_api);
-
-#if !IS_ENABLED(CONFIG_NRF_802154_SERIALIZATION)
-	/* The serialization API does not support disabling the auto-ack. */
-	nrf_802154_auto_ack_set(false);
-#endif
-
-	radio_api->configure(radio_dev, IEEE802154_CONFIG_PROMISCUOUS, &config);
+    sniffer = &sniffer_zephyr;
+    sniffer->init();
 
 	return 0;
 }
